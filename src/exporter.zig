@@ -28,70 +28,137 @@ pub const Exporter = struct {
     pub fn writeUsers(self: *Exporter, users: []const models.User) !void {
         const file = try self.base_dir.createFile("users.json", .{});
         defer file.close();
-        const json_str = try std.json.Stringify.valueAlloc(self.allocator, users, .{});
-        defer self.allocator.free(json_str);
-        try file.writeAll(json_str);
+        var write_buf: [65536]u8 = undefined;
+        var f_writer = file.writer(&write_buf);
+        try std.json.Stringify.value(users, .{}, &f_writer.interface);
+        try f_writer.interface.flush();
     }
 
     pub fn writeChannels(self: *Exporter, channels: []const models.Channel) !void {
         const file = try self.base_dir.createFile("channels.json", .{});
         defer file.close();
-        const json_str = try std.json.Stringify.valueAlloc(self.allocator, channels, .{});
-        defer self.allocator.free(json_str);
-        try file.writeAll(json_str);
+        var write_buf: [65536]u8 = undefined;
+        var f_writer = file.writer(&write_buf);
+        try std.json.Stringify.value(channels, .{}, &f_writer.interface);
+        try f_writer.interface.flush();
         
         for (channels) |ch| {
             try self.base_dir.makePath(ch.name);
         }
     }
 
-    pub fn writeMessages(self: *Exporter, messages: []const models.Message, channels: []const models.Channel) !void {
-        log.info("Writing {d} messages to channel files...", .{messages.len});
-        var current_msg_list: std.ArrayList(models.Message) = .empty;
-        defer current_msg_list.deinit(self.allocator);
+    pub fn writeMessages(self: *Exporter, messages: []models.Message, channels: []const models.Channel) !void {
+        log.info("Writing {d} messages to channel files using parallelism...", .{messages.len});
+        const timer_start = std.time.milliTimestamp();
 
-        var last_key: std.ArrayList(u8) = .empty;
-        defer last_key.deinit(self.allocator);
+        const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
+        var pool: std.Thread.Pool = undefined;
+        try pool.init(.{ .allocator = self.allocator, .n_jobs = cpu_count });
+        defer pool.deinit();
 
-        for (messages) |msg| {
+        var wg: std.Thread.WaitGroup = .{};
+
+        // Actually, we can just sort the message array by channel_id first.
+        // It's already sorted by TS. Sorting by channel_id (stable) will group channels while keeping TS order within channel.
+        std.sort.pdq(models.Message, messages, {}, struct {
+            fn lessThan(_: void, a: models.Message, b: models.Message) bool {
+                return std.mem.lessThan(u8, a.channel_id.?, b.channel_id.?);
+            }
+        }.lessThan);
+
+        var start_idx: usize = 0;
+        while (start_idx < messages.len) {
+            const current_ch_id = messages[start_idx].channel_id.?;
+            var end_idx = start_idx + 1;
+            while (end_idx < messages.len and std.mem.eql(u8, messages[end_idx].channel_id.?, current_ch_id)) {
+                end_idx += 1;
+            }
+
+            const channel_msgs = messages[start_idx..end_idx];
             const ch_name = blk: {
                 for (channels) |c| {
-                    if (std.mem.eql(u8, c.id, msg.channel_id.?)) break :blk c.name;
+                    if (std.mem.eql(u8, c.id, current_ch_id)) break :blk c.name;
                 }
                 break :blk "unknown";
             };
 
-            const ts_f = try std.fmt.parseFloat(f64, msg.ts);
-            const date_str = try self.formatDate(@intFromFloat(ts_f));
-            defer self.allocator.free(date_str);
+            wg.start();
+            try pool.spawn(writeChannelMessages, .{ self, ch_name, channel_msgs, &wg });
+            
+            start_idx = end_idx;
+        }
 
-            const key = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ ch_name, date_str });
-            defer self.allocator.free(key);
+        pool.waitAndWork(&wg);
+        const total_done = std.time.milliTimestamp();
+        log.info("Finished writing files in {d}ms", .{total_done - timer_start});
+    }
 
-            if (!std.mem.eql(u8, key, last_key.items)) {
+    fn writeChannelMessages(self: *Exporter, ch_name: []const u8, messages: []const models.Message, wg: *std.Thread.WaitGroup) void {
+        defer wg.finish();
+        
+        // Use a local arena for temporary strings (keys, dates)
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const allocator = arena.allocator();
+
+        var current_msg_list: std.ArrayList(models.Message) = .empty;
+        defer current_msg_list.deinit(allocator);
+        var last_date: ?[]const u8 = null;
+
+        for (messages) |msg| {
+            const ts_f = std.fmt.parseFloat(f64, msg.ts) catch continue;
+            const date_str = self.formatDateThreadSafe(allocator, @intFromFloat(ts_f)) catch continue;
+
+            if (last_date == null or !std.mem.eql(u8, date_str, last_date.?)) {
                 if (current_msg_list.items.len > 0) {
-                    try self.flushMessages(last_key.items, current_msg_list.items);
+                    self.flushMessagesThreadSafe(ch_name, last_date.?, current_msg_list.items) catch {};
                     current_msg_list.clearRetainingCapacity();
                 }
-                last_key.clearRetainingCapacity();
-                try last_key.appendSlice(self.allocator, key);
+                last_date = date_str;
             }
-            try current_msg_list.append(self.allocator, msg);
+            current_msg_list.append(allocator, msg) catch {};
         }
 
         if (current_msg_list.items.len > 0) {
-            try self.flushMessages(last_key.items, current_msg_list.items);
+            self.flushMessagesThreadSafe(ch_name, last_date.?, current_msg_list.items) catch {};
         }
     }
 
-    fn flushMessages(self: *Exporter, path_suffix: []const u8, msgs: []const models.Message) !void {
-        const full_path = try std.fmt.allocPrint(self.allocator, "{s}.json", .{path_suffix});
-        defer self.allocator.free(full_path);
-        const file = try self.base_dir.createFile(full_path, .{});
+    fn flushMessagesThreadSafe(self: *Exporter, ch_name: []const u8, date_str: []const u8, msgs: []const models.Message) !void {
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/{s}.json", .{ ch_name, date_str });
+        defer self.allocator.free(path);
+        
+        const file = try self.base_dir.createFile(path, .{});
         defer file.close();
-        const json_str = try std.json.Stringify.valueAlloc(self.allocator, msgs, .{});
-        defer self.allocator.free(json_str);
-        try file.writeAll(json_str);
+        
+        // Use a 64KB buffer for streaming JSON to disk
+        var write_buf: [65536]u8 = undefined;
+        var f_writer = file.writer(&write_buf);
+        try std.json.Stringify.value(msgs, .{}, &f_writer.interface);
+        try f_writer.interface.flush();
+    }
+
+    fn formatDateThreadSafe(self: *Exporter, allocator: std.mem.Allocator, ts: i64) ![]const u8 {
+        _ = self;
+        const seconds_in_day = 86400;
+        const days_since_epoch = @divFloor(ts, seconds_in_day);
+        var year: i32 = 1970;
+        var remaining_days = days_since_epoch;
+        while (true) {
+            const is_leap = (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
+            const days_in_year: i32 = if (is_leap) 366 else 365;
+            if (remaining_days < days_in_year) break;
+            remaining_days -= days_in_year;
+            year += 1;
+        }
+        const is_leap = (@rem(year, 4) == 0 and @rem(year, 100) != 0) or (@rem(year, 400) == 0);
+        const month_days = [_]i32{ 31, if (is_leap) 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+        var month: usize = 0;
+        while (remaining_days >= month_days[month]) {
+            remaining_days -= month_days[month];
+            month += 1;
+        }
+        return std.fmt.allocPrint(allocator, "{:0>4}-{:0>2}-{:0>2}", .{ @as(u32, @intCast(year)), @as(u32, @intCast(month + 1)), @as(u32, @intCast(remaining_days + 1)) });
     }
 
     pub fn finalize(self: *Exporter, output_filename: []const u8) !void {
@@ -110,7 +177,7 @@ pub const Exporter = struct {
         const full_zip_path = try std.fs.path.join(self.allocator, &[_][]const u8{ absolute_output_path, zip_filename });
         defer self.allocator.free(full_zip_path);
 
-        var child = std.process.Child.init(&[_][]const u8{ "zip", "-q", "-r", full_zip_path, "." }, self.allocator);
+        var child = std.process.Child.init(&[_][]const u8{ "zip", "-q", "-1", "-r", full_zip_path, "." }, self.allocator);
         
         const absolute_base_path = try std.fs.cwd().realpathAlloc(self.allocator, self.path);
         defer self.allocator.free(absolute_base_path);
@@ -208,6 +275,34 @@ test "exporter test" {
     }
 
     try exporter.writeChannels(&channels);
+
+    var msgs = [_]models.Message{
+        .{
+            .user = try allocator.dupe(u8, "U123"),
+            .ts = try allocator.dupe(u8, "1755594129.627859"),
+            .client_msg_id = try allocator.dupe(u8, "uuid"),
+            .text = try allocator.dupe(u8, "hello"),
+            .team = try allocator.dupe(u8, "T1"),
+            .user_team = try allocator.dupe(u8, "T1"),
+            .source_team = try allocator.dupe(u8, "T1"),
+            .user_profile = .{
+                .avatar_hash = try allocator.dupe(u8, "abc"),
+                .image_72 = try allocator.dupe(u8, "url"),
+                .first_name = try allocator.dupe(u8, "John"),
+                .real_name = try allocator.dupe(u8, "John"),
+                .display_name = try allocator.dupe(u8, "John"),
+                .team = try allocator.dupe(u8, "T1"),
+                .name = try allocator.dupe(u8, "john"),
+            },
+            .blocks = try allocator.alloc(std.json.Value, 0),
+            .channel_id = try allocator.dupe(u8, "C123"),
+        }
+    };
+    defer {
+        for (msgs) |m| m.deinit(allocator);
+    }
+
+    try exporter.writeMessages(&msgs, &channels);
 
     try std.fs.cwd().access(test_path ++ "/users.json", .{});
     try std.fs.cwd().access(test_path ++ "/channels.json", .{});

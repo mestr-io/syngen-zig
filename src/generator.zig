@@ -94,10 +94,11 @@ pub const Generator = struct {
         users: []const models.User,
         days: usize,
         thread_prob: f64,
+        arenas: []std.heap.ArenaAllocator,
     ) ![]models.Message {
         const timer_start = std.time.milliTimestamp();
-        const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
-        log.info("Generating {d} messages using {d} threads...", .{ count, cpu_count });
+        const cpu_count = arenas.len;
+        log.info("Generating {d} messages using {d} threads (lock-free arenas)...", .{ count, cpu_count });
 
         var messages = try self.allocator.alloc(models.Message, count);
         errdefer self.allocator.free(messages);
@@ -121,14 +122,14 @@ pub const Generator = struct {
                 const chunk = messages[chunk_start..chunk_end];
 
                 wg.start();
-                try pool.spawn(generateChunk, .{ self, chunk, channels, users, start, days, self.rand.uintAtMost(u64, std.math.maxInt(u64)), &wg });
+                try pool.spawn(generateChunk, .{ self, chunk, channels, users, start, days, self.rand.uintAtMost(u64, std.math.maxInt(u64)), &wg, &arenas[t_idx] });
             }
             pool.waitAndWork(&wg);
         } else {
             // Single-threaded fallback
             var wg: std.Thread.WaitGroup = .{};
             wg.start();
-            generateChunk(self, messages, channels, users, start, days, self.rand.uintAtMost(u64, std.math.maxInt(u64)), &wg);
+            generateChunk(self, messages, channels, users, start, days, self.rand.uintAtMost(u64, std.math.maxInt(u64)), &wg, &arenas[0]);
         }
 
         const gen_done = std.time.milliTimestamp();
@@ -146,6 +147,9 @@ pub const Generator = struct {
 
         // Threading Pass (Sequential)
         log.info("Applying conversation threading...", .{});
+        // For threading pass, we use the first arena for new allocations (replies etc)
+        const thread_allocator = arenas[0].allocator();
+
         var active_threads = try self.allocator.alloc(?usize, channels.len);
         defer self.allocator.free(active_threads);
         for (active_threads) |*at| at.* = null;
@@ -167,29 +171,27 @@ pub const Generator = struct {
                 const m_ts = try std.fmt.parseFloat(f64, messages[i].ts);
                 
                 if (m_ts - p_ts < 3 * 24 * 3600 and self.rand.float(f64) < thread_prob) {
-                    messages[i].thread_ts = try self.allocator.dupe(u8, parent.ts);
-                    messages[i].parent_user_id = try self.allocator.dupe(u8, parent.user);
+                    messages[i].thread_ts = try thread_allocator.dupe(u8, parent.ts);
+                    messages[i].parent_user_id = try thread_allocator.dupe(u8, parent.user);
                     
                     if (parent.reply_count) |rc| {
                         parent.reply_count = rc + 1;
                     } else {
                         parent.reply_count = 1;
-                        parent.thread_ts = try self.allocator.dupe(u8, parent.ts);
-                        parent.replies = try self.allocator.alloc(models.ReplyInfo, 0);
-                        parent.reply_users = try self.allocator.alloc([]const u8, 0);
+                        parent.thread_ts = try thread_allocator.dupe(u8, parent.ts);
+                        parent.replies = try thread_allocator.alloc(models.ReplyInfo, 0);
+                        parent.reply_users = try thread_allocator.alloc([]const u8, 0);
                     }
                     
-                    if (parent.latest_reply) |lr| self.allocator.free(lr);
-                    parent.latest_reply = try self.allocator.dupe(u8, messages[i].ts);
+                    parent.latest_reply = try thread_allocator.dupe(u8, messages[i].ts);
                     
                     // Add to replies array
-                    var new_replies = try self.allocator.alloc(models.ReplyInfo, parent.replies.?.len + 1);
+                    var new_replies = try thread_allocator.alloc(models.ReplyInfo, parent.replies.?.len + 1);
                     for (parent.replies.?, 0..) |r, r_idx| new_replies[r_idx] = r;
                     new_replies[parent.replies.?.len] = .{
-                        .user = try self.allocator.dupe(u8, messages[i].user),
-                        .ts = try self.allocator.dupe(u8, messages[i].ts),
+                        .user = try thread_allocator.dupe(u8, messages[i].user),
+                        .ts = try thread_allocator.dupe(u8, messages[i].ts),
                     };
-                    self.allocator.free(parent.replies.?);
                     parent.replies = new_replies;
 
                     // Update reply users
@@ -201,10 +203,9 @@ pub const Generator = struct {
                         }
                     }
                     if (!found_user) {
-                        var new_users = try self.allocator.alloc([]const u8, parent.reply_users.?.len + 1);
+                        var new_users = try thread_allocator.alloc([]const u8, parent.reply_users.?.len + 1);
                         for (parent.reply_users.?, 0..) |u, u_idx| new_users[u_idx] = u;
-                        new_users[parent.reply_users.?.len] = try self.allocator.dupe(u8, messages[i].user);
-                        self.allocator.free(parent.reply_users.?);
+                        new_users[parent.reply_users.?.len] = try thread_allocator.dupe(u8, messages[i].user);
                         parent.reply_users = new_users;
                         parent.reply_users_count = @intCast(new_users.len);
                     }
@@ -232,11 +233,14 @@ pub const Generator = struct {
         days: usize,
         seed: u64,
         wg: *std.Thread.WaitGroup,
+        arena: *std.heap.ArenaAllocator,
     ) void {
+        _ = self;
         defer wg.finish();
+        const allocator = arena.allocator();
         var prng = std.Random.DefaultPrng.init(seed);
         const rand = prng.random();
-        var thread_faker = Faker.init(self.allocator, rand);
+        var thread_faker = Faker.init(allocator, rand);
 
         for (0..chunk.len) |i| {
             // Local implementation of Gaussian picking to avoid shared state
@@ -273,29 +277,29 @@ pub const Generator = struct {
             if (user_obj == null) user_obj = users[0];
 
             const ts_f = @as(f64, @floatFromInt(start)) + rand.float(f64) * @as(f64, @floatFromInt(days * 24 * 3600));
-            const ts_str = std.fmt.allocPrint(self.allocator, "{d:.6}", .{ts_f}) catch unreachable;
+            const ts_str = std.fmt.allocPrint(allocator, "{d:.6}", .{ts_f}) catch unreachable;
             const text = thread_faker.sentence(3, 15) catch unreachable;
             const uuid = thread_faker.generateUuid();
 
             chunk[i] = models.Message{
-                .user = self.allocator.dupe(u8, user_id) catch unreachable,
+                .user = allocator.dupe(u8, user_id) catch unreachable,
                 .ts = ts_str,
-                .client_msg_id = self.allocator.dupe(u8, &uuid) catch unreachable,
+                .client_msg_id = allocator.dupe(u8, &uuid) catch unreachable,
                 .text = text,
-                .team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
-                .user_team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
-                .source_team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                .team = allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                .user_team = allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                .source_team = allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
                 .user_profile = .{
-                    .avatar_hash = self.allocator.dupe(u8, user_obj.?.profile.avatar_hash) catch unreachable,
-                    .image_72 = self.allocator.dupe(u8, user_obj.?.profile.image_72) catch unreachable,
-                    .first_name = self.allocator.dupe(u8, user_obj.?.profile.first_name) catch unreachable,
-                    .real_name = self.allocator.dupe(u8, user_obj.?.profile.real_name) catch unreachable,
-                    .display_name = self.allocator.dupe(u8, user_obj.?.profile.display_name) catch unreachable,
-                    .team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
-                    .name = self.allocator.dupe(u8, user_obj.?.name) catch unreachable,
+                    .avatar_hash = allocator.dupe(u8, user_obj.?.profile.avatar_hash) catch unreachable,
+                    .image_72 = allocator.dupe(u8, user_obj.?.profile.image_72) catch unreachable,
+                    .first_name = allocator.dupe(u8, user_obj.?.profile.first_name) catch unreachable,
+                    .real_name = allocator.dupe(u8, user_obj.?.profile.real_name) catch unreachable,
+                    .display_name = allocator.dupe(u8, user_obj.?.profile.display_name) catch unreachable,
+                    .team = allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                    .name = allocator.dupe(u8, user_obj.?.name) catch unreachable,
                 },
-                .blocks = self.allocator.alloc(std.json.Value, 0) catch unreachable,
-                .channel_id = self.allocator.dupe(u8, ch.id) catch unreachable,
+                .blocks = allocator.alloc(std.json.Value, 0) catch unreachable,
+                .channel_id = allocator.dupe(u8, ch.id) catch unreachable,
             };
         }
     }
@@ -318,9 +322,17 @@ test "generator test" {
         allocator.free(channels);
     }
 
-    const msgs = try gen.generateMessages(10, channels, users, 30, 0.5);
+    const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
+    const arenas = try allocator.alloc(std.heap.ArenaAllocator, cpu_count);
+    defer allocator.free(arenas);
+    for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(allocator);
+    defer for (arenas) |*a| a.deinit();
+
+    const msgs = try gen.generateMessages(10, channels, users, 30, 0.5, arenas);
     defer {
-        for (msgs) |m| m.deinit(allocator);
+        // Message strings are in arenas, so we don't call m.deinit(allocator)
+        // because that would try to free individual strings from the GPA.
+        // We just free the array.
         allocator.free(msgs);
     }
 

@@ -99,11 +99,15 @@ pub fn main() !void {
 
     try printer.print("Generating {d} messages over {d} days...\n", .{ message_count, days });
     try printer.flush();
-    const messages = try gen.generateMessages(message_count, channels, users, days, thread_prob);
-    defer {
-        for (messages) |m| m.deinit(allocator);
-        allocator.free(messages);
-    }
+
+    const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
+    const arenas = try allocator.alloc(std.heap.ArenaAllocator, cpu_count);
+    defer allocator.free(arenas);
+    for (arenas) |*a| a.* = std.heap.ArenaAllocator.init(allocator);
+    defer for (arenas) |*a| a.deinit();
+
+    const messages = try gen.generateMessages(message_count, channels, users, days, thread_prob, arenas);
+    defer allocator.free(messages);
     log.info("Generated {d} messages", .{messages.len});
 
     const temp_dir = "temp_export";

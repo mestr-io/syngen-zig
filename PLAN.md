@@ -79,6 +79,12 @@ syngen-zig [options] <output_filename.zip>
 - [x] Parallelize "Pass 1" of message generation (data creation).
 - [x] Optimize memory access patterns for multi-core scaling.
 
+### Phase 9: Performance Optimization (Bottleneck Resolution) - **Completed**
+- [x] **Lock-Free Memory**: Implement Thread-Local `ArenaAllocator` for message generation to eliminate global lock contention in the GPA.
+- [x] **Parallel Exporter**: Distribute the writing of thousands of JSON files across the thread pool.
+- [x] **Archive Optimization**: Switch to fast compression (`-1`) and investigate batching to reduce zip overhead.
+- [x] **I/O Buffering**: Increase buffer sizes for file writing to reduce syscall overhead.
+
 ## 5. Rules & Guidelines
 - **No Global State**: All components must accept an `Allocator`.
 - **Memory Safety**: Use `ArenaAllocator` for generation cycles to ensure zero leaks.
