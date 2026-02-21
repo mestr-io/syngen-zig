@@ -73,11 +73,11 @@ syngen-zig [options] <output_filename.zip>
 - [x] Configure `std_options` for log level control.
 - [x] Implement scoped logging (`.syngen`).
 
-### Phase 8: Multi-threaded Generation
-- [ ] Use `std.Thread.Pool` to parallelize data generation.
-- [ ] Implement per-thread PRNG state for thread-safe randomness.
-- [ ] Parallelize "Pass 1" of message generation (data creation).
-- [ ] Optimize memory access patterns for multi-core scaling.
+### Phase 8: Multi-threaded Generation - **Completed**
+- [x] Use `std.Thread.Pool` to parallelize data generation.
+- [x] Implement per-thread PRNG state for thread-safe randomness.
+- [x] Parallelize "Pass 1" of message generation (data creation).
+- [x] Optimize memory access patterns for multi-core scaling.
 
 ## 5. Rules & Guidelines
 - **No Global State**: All components must accept an `Allocator`.

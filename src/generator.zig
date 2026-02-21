@@ -95,63 +95,57 @@ pub const Generator = struct {
         days: usize,
         thread_prob: f64,
     ) ![]models.Message {
-        log.info("Generating {d} messages...", .{count});
+        const timer_start = std.time.milliTimestamp();
+        const cpu_count = @max(1, std.Thread.getCpuCount() catch 1);
+        log.info("Generating {d} messages using {d} threads...", .{ count, cpu_count });
+
         var messages = try self.allocator.alloc(models.Message, count);
         errdefer self.allocator.free(messages);
 
         const now = std.time.timestamp();
         const start = now - @as(i64, @intCast(days * 24 * 3600));
 
-        for (0..count) |i| {
-            const ch_idx = self.randGaussianIndex(channels.len);
-            const ch = channels[ch_idx];
-            
-            const m_idx = self.rand.uintAtMost(usize, ch.members.len - 1);
-            const user_id = ch.members[m_idx];
-            
-            var user_obj: ?models.User = null;
-            for (users) |u| {
-                if (std.mem.eql(u8, u.id, user_id)) {
-                    user_obj = u;
-                    break;
-                }
+        // Pass 1: Parallel Generation
+        if (cpu_count > 1 and count > 100) {
+            var pool: std.Thread.Pool = undefined;
+            try pool.init(.{ .allocator = self.allocator, .n_jobs = cpu_count });
+            defer pool.deinit();
+
+            const chunk_size = (count + cpu_count - 1) / cpu_count;
+            var wg: std.Thread.WaitGroup = .{};
+
+            for (0..cpu_count) |t_idx| {
+                const chunk_start = t_idx * chunk_size;
+                if (chunk_start >= count) break;
+                const chunk_end = @min(chunk_start + chunk_size, count);
+                const chunk = messages[chunk_start..chunk_end];
+
+                wg.start();
+                try pool.spawn(generateChunk, .{ self, chunk, channels, users, start, days, self.rand.uintAtMost(u64, std.math.maxInt(u64)), &wg });
             }
-            if (user_obj == null) user_obj = users[0];
-
-            const ts_f = @as(f64, @floatFromInt(start)) + self.rand.float(f64) * @as(f64, @floatFromInt(days * 24 * 3600));
-            const ts_str = try std.fmt.allocPrint(self.allocator, "{d:.6}", .{ts_f});
-            const text = try self.faker.sentence(3, 15);
-            const uuid = self.faker.generateUuid();
-
-            messages[i] = models.Message{
-                .user = try self.allocator.dupe(u8, user_id),
-                .ts = ts_str,
-                .client_msg_id = try self.allocator.dupe(u8, &uuid),
-                .text = text,
-                .team = try self.allocator.dupe(u8, user_obj.?.team_id),
-                .user_team = try self.allocator.dupe(u8, user_obj.?.team_id),
-                .source_team = try self.allocator.dupe(u8, user_obj.?.team_id),
-                .user_profile = .{
-                    .avatar_hash = try self.allocator.dupe(u8, user_obj.?.profile.avatar_hash),
-                    .image_72 = try self.allocator.dupe(u8, user_obj.?.profile.image_72),
-                    .first_name = try self.allocator.dupe(u8, user_obj.?.profile.first_name),
-                    .real_name = try self.allocator.dupe(u8, user_obj.?.profile.real_name),
-                    .display_name = try self.allocator.dupe(u8, user_obj.?.profile.display_name),
-                    .team = try self.allocator.dupe(u8, user_obj.?.team_id),
-                    .name = try self.allocator.dupe(u8, user_obj.?.name),
-                },
-                .blocks = try self.allocator.alloc(std.json.Value, 0),
-                .channel_id = try self.allocator.dupe(u8, ch.id),
-            };
+            pool.waitAndWork(&wg);
+        } else {
+            // Single-threaded fallback
+            var wg: std.Thread.WaitGroup = .{};
+            wg.start();
+            generateChunk(self, messages, channels, users, start, days, self.rand.uintAtMost(u64, std.math.maxInt(u64)), &wg);
         }
 
+        const gen_done = std.time.milliTimestamp();
+        log.info("Data creation took {d}ms", .{gen_done - timer_start});
+
+        // Sort messages by TS
         std.sort.pdq(models.Message, messages, {}, struct {
             fn lessThan(_: void, a: models.Message, b: models.Message) bool {
                 return std.mem.lessThan(u8, a.ts, b.ts);
             }
         }.lessThan);
 
-        // Threading Pass
+        const sort_done = std.time.milliTimestamp();
+        log.info("Sorting took {d}ms", .{sort_done - gen_done});
+
+        // Threading Pass (Sequential)
+        log.info("Applying conversation threading...", .{});
         var active_threads = try self.allocator.alloc(?usize, channels.len);
         defer self.allocator.free(active_threads);
         for (active_threads) |*at| at.* = null;
@@ -223,7 +217,87 @@ pub const Generator = struct {
             }
         }
 
+        const total_done = std.time.milliTimestamp();
+        log.info("Total message processing took {d}ms", .{total_done - timer_start});
+
         return messages;
+    }
+
+    fn generateChunk(
+        self: *Generator,
+        chunk: []models.Message,
+        channels: []const models.Channel,
+        users: []const models.User,
+        start: i64,
+        days: usize,
+        seed: u64,
+        wg: *std.Thread.WaitGroup,
+    ) void {
+        defer wg.finish();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rand = prng.random();
+        var thread_faker = Faker.init(self.allocator, rand);
+
+        for (0..chunk.len) |i| {
+            // Local implementation of Gaussian picking to avoid shared state
+            const ch_idx = blk: {
+                const max = channels.len;
+                if (max <= 1) break :blk 0;
+                const mean = @as(f64, @floatFromInt(max)) / 2.0;
+                const sigma = @as(f64, @floatFromInt(max)) / 6.0;
+                
+                // Inline Box-Muller
+                var vx1: f64 = rand.float(f64);
+                const vx2: f64 = rand.float(f64);
+                if (vx1 < 1e-9) vx1 = 1e-9;
+                const norm = @sqrt(-2.0 * @log(vx1)) * @cos(2.0 * std.math.pi * vx2);
+                
+                const val = norm * sigma + mean;
+                const idx = @as(isize, @intFromFloat(@round(val)));
+                if (idx < 0) break :blk 0;
+                if (idx >= @as(isize, @intCast(max))) break :blk max - 1;
+                break :blk @as(usize, @intCast(idx));
+            };
+
+            const ch = channels[ch_idx];
+            const m_idx = rand.uintAtMost(usize, ch.members.len - 1);
+            const user_id = ch.members[m_idx];
+            
+            var user_obj: ?models.User = null;
+            for (users) |u| {
+                if (std.mem.eql(u8, u.id, user_id)) {
+                    user_obj = u;
+                    break;
+                }
+            }
+            if (user_obj == null) user_obj = users[0];
+
+            const ts_f = @as(f64, @floatFromInt(start)) + rand.float(f64) * @as(f64, @floatFromInt(days * 24 * 3600));
+            const ts_str = std.fmt.allocPrint(self.allocator, "{d:.6}", .{ts_f}) catch unreachable;
+            const text = thread_faker.sentence(3, 15) catch unreachable;
+            const uuid = thread_faker.generateUuid();
+
+            chunk[i] = models.Message{
+                .user = self.allocator.dupe(u8, user_id) catch unreachable,
+                .ts = ts_str,
+                .client_msg_id = self.allocator.dupe(u8, &uuid) catch unreachable,
+                .text = text,
+                .team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                .user_team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                .source_team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                .user_profile = .{
+                    .avatar_hash = self.allocator.dupe(u8, user_obj.?.profile.avatar_hash) catch unreachable,
+                    .image_72 = self.allocator.dupe(u8, user_obj.?.profile.image_72) catch unreachable,
+                    .first_name = self.allocator.dupe(u8, user_obj.?.profile.first_name) catch unreachable,
+                    .real_name = self.allocator.dupe(u8, user_obj.?.profile.real_name) catch unreachable,
+                    .display_name = self.allocator.dupe(u8, user_obj.?.profile.display_name) catch unreachable,
+                    .team = self.allocator.dupe(u8, user_obj.?.team_id) catch unreachable,
+                    .name = self.allocator.dupe(u8, user_obj.?.name) catch unreachable,
+                },
+                .blocks = self.allocator.alloc(std.json.Value, 0) catch unreachable,
+                .channel_id = self.allocator.dupe(u8, ch.id) catch unreachable,
+            };
+        }
     }
 };
 
