@@ -2,6 +2,8 @@ const std = @import("std");
 const models = @import("models.zig");
 const Faker = @import("faker.zig").Faker;
 
+const log = std.log.scoped(.syngen_gen);
+
 pub const Generator = struct {
     allocator: std.mem.Allocator,
     faker: Faker,
@@ -93,6 +95,7 @@ pub const Generator = struct {
         days: usize,
         thread_prob: f64,
     ) ![]models.Message {
+        log.info("Generating {d} messages...", .{count});
         var messages = try self.allocator.alloc(models.Message, count);
         errdefer self.allocator.free(messages);
 

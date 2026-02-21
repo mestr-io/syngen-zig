@@ -4,6 +4,12 @@ const models = syngen_zig.models;
 const Generator = syngen_zig.generator.Generator;
 const Exporter = syngen_zig.exporter.Exporter;
 
+pub const std_options: std.Options = .{
+    .log_level = .info,
+};
+
+const log = std.log.scoped(.syngen);
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -52,42 +58,57 @@ pub fn main() !void {
     }
 
     if (output_filename == null) {
-        std.debug.print("Usage: syngen-zig [options] <output_filename.zip>\n", .{});
-        std.debug.print("Options:\n", .{});
-        std.debug.print("  -u, --users <count>      Number of users (default: 10)\n", .{});
-        std.debug.print("  -c, --channels <count>   Number of channels (default: 5)\n", .{});
-        std.debug.print("  -m, --messages <count>   Total messages (default: 1000)\n", .{});
-        std.debug.print("  -t, --threads <prob>     Threading probability 0.0-1.0 (default: 0.1)\n", .{});
-        std.debug.print("  -d, --days <count>       Time window in days (default: 30)\n", .{});
+        var buf: [4096]u8 = undefined;
+        var printer = syngen_zig.printer.Printer.init(&buf);
+        try printer.print("Usage: syngen-zig [options] <output_filename.zip>\n", .{});
+        try printer.print("Options:\n", .{});
+        try printer.print("  -u, --users <count>      Number of users (default: 10)\n", .{});
+        try printer.print("  -c, --channels <count>   Number of channels (default: 5)\n", .{});
+        try printer.print("  -m, --messages <count>   Total messages (default: 1000)\n", .{});
+        try printer.print("  -t, --threads <prob>     Threading probability 0.0-1.0 (default: 0.1)\n", .{});
+        try printer.print("  -d, --days <count>       Time window in days (default: 30)\n", .{});
+        try printer.flush();
         return;
     }
 
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
     var gen = Generator.init(allocator, prng.random());
 
-    std.debug.print("Generating {d} users...\n", .{user_count});
+    var stdout_buf: [4096]u8 = undefined;
+    var printer = syngen_zig.printer.Printer.init(&stdout_buf);
+
+    log.info("Starting generation: users={d}, channels={d}, messages={d}, days={d}", .{ user_count, channel_count, message_count, days });
+
+    try printer.print("Generating {d} users...\n", .{user_count});
+    try printer.flush();
     const users = try gen.generateUsers(user_count, "T012345678");
     defer {
         for (users) |u| u.deinit(allocator);
         allocator.free(users);
     }
+    log.info("Generated {d} users", .{users.len});
 
-    std.debug.print("Generating {d} channels...\n", .{channel_count});
+    try printer.print("Generating {d} channels...\n", .{channel_count});
+    try printer.flush();
     const channels = try gen.generateChannels(channel_count, users);
     defer {
         for (channels) |c| c.deinit(allocator);
         allocator.free(channels);
     }
+    log.info("Generated {d} channels", .{channels.len});
 
-    std.debug.print("Generating {d} messages over {d} days...\n", .{ message_count, days });
+    try printer.print("Generating {d} messages over {d} days...\n", .{ message_count, days });
+    try printer.flush();
     const messages = try gen.generateMessages(message_count, channels, users, days, thread_prob);
     defer {
         for (messages) |m| m.deinit(allocator);
         allocator.free(messages);
     }
+    log.info("Generated {d} messages", .{messages.len});
 
     const temp_dir = "temp_export";
-    std.debug.print("Writing files to {s}...\n", .{temp_dir});
+    try printer.print("Writing files to {s}...\n", .{temp_dir});
+    try printer.flush();
     var exporter = try Exporter.init(allocator, temp_dir);
     defer {
         exporter.deinit();
@@ -97,9 +118,13 @@ pub fn main() !void {
     try exporter.writeUsers(users);
     try exporter.writeChannels(channels);
     try exporter.writeMessages(messages, channels);
+    log.info("Wrote files to disk", .{});
 
-    std.debug.print("Creating archive {s}...\n", .{output_filename.?});
+    try printer.print("Creating archive {s}...\n", .{output_filename.?});
+    try printer.flush();
     try exporter.finalize(output_filename.?);
+    log.info("Created archive: {s}", .{output_filename.?});
 
-    std.debug.print("Done!\n", .{});
+    try printer.print("Done!\n", .{});
+    try printer.flush();
 }

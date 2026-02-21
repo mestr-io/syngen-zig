@@ -1,6 +1,8 @@
 const std = @import("std");
 const models = @import("models.zig");
 
+const log = std.log.scoped(.syngen_exp);
+
 pub const Exporter = struct {
     allocator: std.mem.Allocator,
     base_dir: std.fs.Dir,
@@ -44,6 +46,7 @@ pub const Exporter = struct {
     }
 
     pub fn writeMessages(self: *Exporter, messages: []const models.Message, channels: []const models.Channel) !void {
+        log.info("Writing {d} messages to channel files...", .{messages.len});
         var current_msg_list: std.ArrayList(models.Message) = .empty;
         defer current_msg_list.deinit(self.allocator);
 
