@@ -85,6 +85,12 @@ syngen-zig [options] <output_filename.zip>
 - [x] **Archive Optimization**: Switch to fast compression (`-1`) and investigate batching to reduce zip overhead.
 - [x] **I/O Buffering**: Increase buffer sizes for file writing to reduce syscall overhead.
 
+### Phase 10: Persistent File Logging - **Completed**
+- [x] Implement a custom `logFn` in `std_options` to redirect `std.log` output to a file.
+- [x] Ensure every log line is prefixed with a high-resolution RFC3339-style timestamp.
+- [x] Set up the log file named `syngen_log.log` at the start of execution.
+- [x] Implement thread-safety for logging using a Mutex to prevent interleaved output from parallel workers.
+
 ## 5. Rules & Guidelines
 - **No Global State**: All components must accept an `Allocator`.
 - **Memory Safety**: Use `ArenaAllocator` for generation cycles to ensure zero leaks.

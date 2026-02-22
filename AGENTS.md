@@ -15,17 +15,18 @@ The design of `syngen-zig` leverages proven components and algorithms from the o
 - **Reactions & Files**: Real exports include a `reactions` array and `files` array for attachments.
 
 ### 2. Core Algorithms
-- **Activity Distribution**: Use of the **Box-Muller transform** to generate a Gaussian distribution for channel and user activity. This ensures some channels and users are "louder" than others, mimicking real-world behavior.
-- **Message Generation**:
-  - Messages are generated across a time window and then **sorted by timestamp** before being processed for threading.
-  - **Threading Logic**: A two-pass approach where messages have a 20% chance to start a thread and a configurable `thread_prob` to become a reply to an active thread within a 3-day window.
-- **Export Mapping**: Grouping messages by channel name and date (`YYYY-MM-DD.json`) using a sorted reference index to minimize file handle overhead.
+- **Activity Distribution**: Use of the **Box-Muller transform** to generate a Gaussian distribution for channel and user activity.
+- **Three-Pass Message Generation**:
+  - **Pass 1 (Parallel)**: Multi-threaded raw data creation using thread-local `ArenaAllocators` to avoid global lock contention.
+  - **Pass 2 (Sequential)**: Global timestamp sorting.
+  - **Pass 3 (Sequential)**: Conversation threading logic within a 3-day window.
+- **Parallel Exporter**: Grouping and writing message files (`YYYY-MM-DD.json`) in parallel across multiple CPU cores to minimize I/O wait times.
 
 ### 3. Slack Compatibility
-- Adheres to the Slack Export structure:
-  - `users.json` at root.
-  - `channels.json` at root.
-  - `<channel_name>/<date>.json` for message logs.
+- Adheres to the Slack Export structure (verified against real exports):
+  - `users.json` at root (includes full profile, timezone, and permission flags).
+  - `channels.json` at root (includes topic, purpose, and pins).
+  - `<channel_name>/<date>.json` for message logs (supports `blocks`, `client_msg_id`, and `reactions`).
 
 ## Development Standards (Zig 0.15)
 `syngen-zig` must follow modern Zig idiomatic patterns to ensure safety and performance:

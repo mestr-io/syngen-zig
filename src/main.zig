@@ -4,9 +4,38 @@ const models = syngen_zig.models;
 const Generator = syngen_zig.generator.Generator;
 const Exporter = syngen_zig.exporter.Exporter;
 
+var log_file: ?std.fs.File = null;
+var log_mutex: std.Thread.Mutex = .{};
+
 pub const std_options: std.Options = .{
     .log_level = .info,
+    .logFn = myLogFn,
 };
+
+pub fn myLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @Type(.enum_literal),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const file = log_file orelse return;
+    log_mutex.lock();
+    defer log_mutex.unlock();
+
+    var buf: [8192]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const allocator = fba.allocator();
+
+    const ts = std.time.timestamp();
+    const scope_name = if (scope == std.log.default_log_scope) "default" else @tagName(scope);
+
+    const prefix = std.fmt.allocPrint(allocator, "{d} [{s}] ({s}): ", .{ ts, level.asText(), scope_name }) catch return;
+    const message = std.fmt.allocPrint(allocator, format, args) catch return;
+
+    file.writeAll(prefix) catch return;
+    file.writeAll(message) catch return;
+    file.writeAll("\n") catch return;
+}
 
 const log = std.log.scoped(.syngen);
 
@@ -14,6 +43,12 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // Initialize log file
+    log_file = try std.fs.cwd().createFile("syngen_log.log", .{});
+    defer {
+        if (log_file) |f| f.close();
+    }
 
     const args = try std.process.argsAlloc(allocator);
     defer std.process.argsFree(allocator, args);

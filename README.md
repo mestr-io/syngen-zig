@@ -43,6 +43,21 @@ To check if the source code follows the Zig formatting standard:
 make lint
 ```
 
+## Logging
+Execution details and performance metrics are written to `syngen_log.log` in the current working directory. Each entry includes a Unix timestamp and the module scope (e.g., generator, exporter).
+
+## Performance Optimizations
+`syngen-zig` is optimized for high-volume generation:
+- **Multi-threading**: Utilizes all available CPU cores via `std.Thread.Pool`.
+- **Lock-Free Memory**: Each worker thread uses its own `ArenaAllocator` to eliminate global allocator locks.
+- **Parallel I/O**: Message logs are written to disk in parallel across channels.
+- **Streaming JSON**: Serializes data directly to disk buffers to minimize memory footprint.
+
+## Documentation
+- **[MODELS.md](MODELS.md)**: Detailed JSON schemas for Slack compatibility.
+- **[ARCHITECTURE.md](ARCHITECTURE.md)**: Data flow, multi-pass algorithms, and threading strategy.
+- **[PLAN.md](PLAN.md)**: Project implementation history and roadmap.
+
 ## Architecture
 - `src/models.zig`: Slack entity definitions and JSON schemas.
 - `src/faker.zig`: Synthetic data generation (names, lorem ipsum, IDs).
